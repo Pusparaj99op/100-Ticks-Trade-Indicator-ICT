@@ -1007,14 +1007,29 @@ namespace _100_Ticks_Trade_Indicator_ICT
         // ══════════════════════════════════════════════════════════════════════
         private void EvaluateSetups()
         {
-            // Expire old setups (older than 2 hours)
-            _activeSetups.RemoveAll(s => (DateTime.UtcNow - s.DetectedAt).TotalHours > 2);
+            // Remove setups older than 4 hours
+            _activeSetups.RemoveAll(s => (DateTime.UtcNow - s.DetectedAt).TotalHours > 4);
 
             double curPrice = Close(0);
-            DateTime curTime = Time(0);
             double tickSize = Symbol?.TickSize ?? 0.1;
 
-            // Check for both Long and Short setups
+            // Remove setups where price has already blown past the entry — these are "past" setups
+            // For a Long: if current price is already far above entry (>20 ticks past entry), it's gone
+            // For a Short: if current price is already far below entry (>20 ticks past entry), it's gone
+            _activeSetups.RemoveAll(s =>
+            {
+                double pastThreshold = 20 * tickSize;
+                if (s.Direction == SetupDirection.Long  && curPrice > s.EntryPrice + pastThreshold) return true;
+                if (s.Direction == SetupDirection.Short && curPrice < s.EntryPrice - pastThreshold) return true;
+                // Also remove if SL has been broken (price moved beyond SL, trade would be stopped)
+                if (s.Direction == SetupDirection.Long  && curPrice < s.StopLoss)  return true;
+                if (s.Direction == SetupDirection.Short && curPrice > s.StopLoss)  return true;
+                return false;
+            });
+
+            DateTime curTime = Time(0);
+
+            // Check for both Long and Short upcoming setups
             EvaluateDirectionalSetup(SetupDirection.Long,  curPrice, curTime, tickSize);
             EvaluateDirectionalSetup(SetupDirection.Short, curPrice, curTime, tickSize);
         }
@@ -1099,7 +1114,7 @@ namespace _100_Ticks_Trade_Indicator_ICT
 
             // ── Skip if we already have a recent equivalent setup ─────────
             bool duplicate = _activeSetups.Any(s =>
-                s.Direction == dir && (curTime - s.DetectedAt).TotalMinutes < 15);
+                s.Direction == dir && (curTime - s.DetectedAt).TotalMinutes < 30);
             if (duplicate) return;
 
             // ── Only register if score meets developing threshold ─────────
@@ -1127,30 +1142,32 @@ namespace _100_Ticks_Trade_Indicator_ICT
                 tp2 = entry - TargetTicks2 * tickSize;
             }
 
+            // Only show upcoming setups — setups that have NOT yet been triggered
+            // IsActive = fully confluent (score >= min), IsUpcomingSetup = developing (score < min)
+            // Both are "upcoming" because price hasn't reached entry yet
             var setup = new TradeSetup
             {
-                Direction      = dir,
-                EntryPrice     = entry,
-                StopLoss       = sl,
-                TakeProfit     = tp1,
-                TakeProfit2    = tp2,
+                Direction       = dir,
+                EntryPrice      = entry,
+                StopLoss        = sl,
+                TakeProfit      = tp1,
+                TakeProfit2     = tp2,
                 ConfluenceScore = score,
-                MaxScore       = 8,
-                DetectedAt     = curTime,
-                IsActive       = score >= MinConfluence,
-                IsUpcomingSetup = score < MinConfluence,
+                MaxScore        = 8,
+                DetectedAt      = curTime,
+                IsActive        = score >= MinConfluence,     // fully-confirmed upcoming
+                IsUpcomingSetup = score < MinConfluence,      // developing upcoming
                 ConfluenceItems = hitList.ToArray(),
-                MissingItems   = missList.ToArray(),
-                AnchorOB       = nearOB,
-                AnchorFVG      = nearFVG
+                MissingItems    = missList.ToArray(),
+                AnchorOB        = nearOB,
+                AnchorFVG       = nearFVG
             };
 
             _activeSetups.Add(setup);
 
             if (score >= MinConfluence)
             {
-                Log($"[SETUP] {dir} | Score={score}/8 | Entry={entry:F1} | SL={sl:F1} | TP={tp1:F1} | {string.Join(", ", hitList)}", LoggingLevel.Trading);
-                // Place setup marker on chart bar
+                Log($"[UPCOMING SETUP] {dir} | Score={score}/8 | Entry={entry:F1} | SL={sl:F1} | TP={tp1:F1} | {string.Join(", ", hitList)}", LoggingLevel.Trading);
                 PlaceSetupMarker(0, dir, StructureType.MSS);
 
                 // Auto-trade if enabled
@@ -1390,7 +1407,8 @@ namespace _100_Ticks_Trade_Indicator_ICT
         {
             var visible = _orderBlocks
                 .Where(ob => ob.Status != ZoneStatus.Broken)
-                .OrderBy(ob => ob.StartTime)
+                .OrderByDescending(ob => ob.StartTime)
+                .Take(4) // Limit to 4 most recent to reduce clutter
                 .ToList();
 
             foreach (var ob in visible)
@@ -1417,16 +1435,16 @@ namespace _100_Ticks_Trade_Indicator_ICT
 
                     // Wick zone (faded)
                     Color obColor = ob.IsBullish
-                        ? (ob.Status == ZoneStatus.Mitigated ? Color.FromArgb(25, 50, 200, 100) : Color.FromArgb(35, 50, 230, 100))
-                        : (ob.Status == ZoneStatus.Mitigated ? Color.FromArgb(25, 200, 50, 50)  : Color.FromArgb(35, 230, 80, 80));
+                        ? (ob.Status == ZoneStatus.Mitigated ? Color.FromArgb(15, 50, 200, 100) : Color.FromArgb(20, 50, 230, 100))
+                        : (ob.Status == ZoneStatus.Mitigated ? Color.FromArgb(15, 200, 50, 50)  : Color.FromArgb(20, 230, 80, 80));
 
                     using (var brush = new SolidBrush(obColor))
                         gr.FillRectangle(brush, xStart, rectTop, width, rectHeight);
 
                     // Body zone (stronger)
                     Color bodyColor = ob.IsBullish
-                        ? Color.FromArgb(55, 50, 230, 100)
-                        : Color.FromArgb(55, 230, 80, 80);
+                        ? Color.FromArgb(30, 50, 230, 100)
+                        : Color.FromArgb(30, 230, 80, 80);
 
                     using (var brush = new SolidBrush(bodyColor))
                         gr.FillRectangle(brush, xStart, bodyTop, width, bodyHeight);
@@ -1450,7 +1468,11 @@ namespace _100_Ticks_Trade_Indicator_ICT
         // ── Fair Value Gap Rectangles ──────────────────────────────────────────
         private void DrawFairValueGaps(Graphics gr, IChartWindowCoordinatesConverter converter, int chartWidth)
         {
-            var visible = _fvgs.Where(f => f.Status == ZoneStatus.Active).ToList();
+            var visible = _fvgs
+                .Where(f => f.Status == ZoneStatus.Active)
+                .OrderByDescending(f => f.StartTime)
+                .Take(3) // Limit to 3 most recent to reduce clutter
+                .ToList();
 
             foreach (var fvg in visible)
             {
@@ -1470,8 +1492,8 @@ namespace _100_Ticks_Trade_Indicator_ICT
                     if (width <= 0 || rectHeight < 2) continue;
 
                     Color fillColor = fvg.IsBullish
-                        ? Color.FromArgb(40, 50, 150, 255)     // Blue for bullish FVG
-                        : Color.FromArgb(40, 255, 140, 0);     // Orange for bearish FVG
+                        ? Color.FromArgb(25, 50, 150, 255)     // Blue for bullish FVG
+                        : Color.FromArgb(25, 255, 140, 0);     // Orange for bearish FVG
 
                     using (var brush = new SolidBrush(fillColor))
                         gr.FillRectangle(brush, xStart, rectTop, width, rectHeight);
@@ -1501,6 +1523,8 @@ namespace _100_Ticks_Trade_Indicator_ICT
         {
             var recentSweeps = _liquiditySweeps
                 .Where(ls => (DateTime.UtcNow - ls.Time).TotalHours <= 24)
+                .OrderByDescending(ls => ls.Time)
+                .Take(5) // Limit to 5 most recent
                 .ToList();
 
             foreach (var sweep in recentSweeps)
@@ -1571,10 +1595,19 @@ namespace _100_Ticks_Trade_Indicator_ICT
             }
         }
 
-        // ── Active Setup Lines (Entry / SL / TP) ──────────────────────────────
+        // ── Upcoming Setup Lines (Entry / SL / TP) — only shows setups not yet triggered ──
         private void DrawActiveSetups(Graphics gr, IChartWindowCoordinatesConverter converter, int chartWidth)
         {
-            foreach (var setup in _activeSetups.OrderByDescending(s => s.ConfluenceScore))
+            // ONLY draw upcoming setups — both fully-confirmed (IsActive) and developing (IsUpcomingSetup)
+            // We never draw "past" setups because those are pruned in EvaluateSetups()
+            var upcomingSetups = _activeSetups
+                .OrderByDescending(s => s.ConfluenceScore)
+                .Take(2) // Max 2 setups drawn to prevent overlap
+                .ToList();
+
+            if (upcomingSetups.Count == 0) return;
+
+            foreach (var setup in upcomingSetups)
             {
                 try
                 {
@@ -1625,7 +1658,10 @@ namespace _100_Ticks_Trade_Indicator_ICT
                     DrawLabel(gr, $"TP2 +{TargetTicks2:F0}t", chartWidth - 100, yTP2 - 14, tp2Col);
 
                     // Score + direction badge (right side)
-                    DrawSetupBadge(gr, setup, chartWidth - 200, yEntry);
+                    // Offset Y if it's the second setup to prevent badge overlap
+                    int badgeY = yEntry;
+                    if (upcomingSetups.IndexOf(setup) == 1) badgeY += 65; 
+                    DrawSetupBadge(gr, setup, chartWidth - 200, badgeY);
                 }
                 catch { }
             }
@@ -1744,8 +1780,8 @@ namespace _100_Ticks_Trade_Indicator_ICT
                 string htfBias   = _htfBullish ? "▲ Bullish" : "▼ Bearish";
                 string tradeCnt  = $"{_tradesExecToday}/{MaxTradesPerDay}";
                 string pnlStr    = $"{(_dailyPnL >= 0 ? "+" : "")}{_dailyPnL:F0}";
-                int    setups    = _activeSetups.Count(s => s.IsActive);
-                int    devSetups = _activeSetups.Count(s => s.IsUpcomingSetup);
+                int    setups    = _activeSetups.Count(s => s.IsActive);          // fully confirmed, price not yet there
+                int    devSetups = _activeSetups.Count(s => s.IsUpcomingSetup);    // developing, not yet fully confirmed
 
                 string posStr    = "FLAT";
                 if (_currentPosition != null && _currentPosition.Quantity != 0)
@@ -1757,8 +1793,8 @@ namespace _100_Ticks_Trade_Indicator_ICT
                     ("SESSION",   session,                  Color.FromArgb(200, 200, 200, 200)),
                     ("KILL ZONE", kzStatus,                 inKZ ? Color.FromArgb(200, 80, 230, 120) : Color.FromArgb(160, 160, 160, 160)),
                     ("1H BIAS",   htfBias,                  _htfBullish ? Color.FromArgb(200, 80, 230, 120) : Color.FromArgb(200, 230, 80, 80)),
-                    ("SETUPS",    $"{setups} active",       Color.FromArgb(200, 200, 200, 80)),
-                    ("DEVELOP",   $"{devSetups} forming",   Color.FromArgb(160, 180, 180, 100)),
+                    ("UPCOMING",  $"{setups} confirmed",    Color.FromArgb(200, 80, 230, 120)),
+                    ("DEVELOP",   $"{devSetups} forming",   Color.FromArgb(160, 200, 200, 80)),
                     ("TRADES",    tradeCnt,                  Color.FromArgb(200, 180, 180, 255)),
                     ("DAY P&L",   pnlStr,                   _dailyPnL >= 0 ? Color.FromArgb(200, 80, 220, 120) : Color.FromArgb(200, 220, 80, 80)),
                     ("POSITION",  posStr,                   posStr == "FLAT" ? Color.FromArgb(160, 160, 160, 160) : Color.FromArgb(200, 255, 200, 50)),
